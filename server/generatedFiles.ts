@@ -1,0 +1,80 @@
+import { resolve } from 'node:path'
+import ts from 'typescript'
+
+export interface GeneratedFile {
+  path: string
+  content: string
+}
+
+const maxFiles = 64
+const maxBytes = 12 * 1024 * 1024
+const generatedPath = /^src\/generated\/[A-Za-z0-9_.-]+\.(ts|glsl)$/
+
+export function validateGeneratedFiles(value: unknown): GeneratedFile[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > maxFiles) {
+    throw new Error(`File batch must contain 1 to ${maxFiles} files`)
+  }
+
+  const seen = new Set<string>()
+  let totalBytes = 0
+  for (const file of value as GeneratedFile[]) {
+    if (!file || typeof file.path !== 'string' || typeof file.content !== 'string') {
+      throw new Error('Every generated file needs string path and content fields')
+    }
+    if (!generatedPath.test(file.path) || file.path.split('/').some((part) => part.startsWith('.'))) {
+      throw new Error(`Generated path must be a direct TypeScript or GLSL child: ${file.path}`)
+    }
+    if (seen.has(file.path)) throw new Error(`Duplicate generated path: ${file.path}`)
+    seen.add(file.path)
+    totalBytes += Buffer.byteLength(file.content, 'utf8')
+  }
+  if (totalBytes > maxBytes) throw new Error(`File batch exceeds ${maxBytes} byte limit`)
+
+  return (value as GeneratedFile[]).slice().sort((a, b) =>
+    Number(a.path.endsWith('/activeLevel.ts')) - Number(b.path.endsWith('/activeLevel.ts')),
+  )
+}
+
+export async function checkGeneratedTypeScript(
+  files: GeneratedFile[],
+  projectRoot: string,
+): Promise<string[]> {
+  const configPath = resolve(projectRoot, 'tsconfig.app.json')
+  const config = ts.readConfigFile(configPath, ts.sys.readFile)
+  if (config.error) return [formatDiagnostics([config.error], projectRoot)]
+
+  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, projectRoot, undefined, configPath)
+  const candidateSources = new Map<string, string>()
+  for (const file of files) {
+    if (file.path.endsWith('.ts')) candidateSources.set(resolve(projectRoot, file.path), file.content)
+  }
+
+  if (candidateSources.size === 0) return []
+
+  const host = ts.createCompilerHost(parsed.options)
+  const baseFileExists = host.fileExists.bind(host)
+  const baseReadFile = host.readFile.bind(host)
+  const baseGetSourceFile = host.getSourceFile.bind(host)
+  host.fileExists = (fileName) => candidateSources.has(resolve(fileName)) || baseFileExists(fileName)
+  host.readFile = (fileName) => candidateSources.get(resolve(fileName)) ?? baseReadFile(fileName)
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) => {
+    const source = candidateSources.get(resolve(fileName))
+    return source === undefined
+      ? baseGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile)
+      : ts.createSourceFile(fileName, source, languageVersion)
+  }
+
+  const rootNames = [...new Set([...parsed.fileNames, ...candidateSources.keys()])]
+  const program = ts.createProgram({ rootNames, options: parsed.options, host })
+  const diagnostics = ts.getPreEmitDiagnostics(program)
+    .filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error)
+  return diagnostics.length === 0 ? [] : [formatDiagnostics(diagnostics, projectRoot)]
+}
+
+function formatDiagnostics(diagnostics: readonly ts.Diagnostic[], projectRoot: string): string {
+  return ts.formatDiagnosticsWithColorAndContext(diagnostics, {
+    getCurrentDirectory: () => projectRoot,
+    getCanonicalFileName: (fileName) => fileName,
+    getNewLine: () => '\n',
+  })
+}
